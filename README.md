@@ -1,4 +1,6 @@
-This study is a part of Alişah Özcan's master's thesis and was done for educational purposes. There may be shortcomings.
+This study is a part of Alişah Özcan's master's thesis and was done for educational purposes.
+This library contains part of (https://eprint.iacr.org/2022/1222) work.
+There may be shortcomings.
 
 In this Library, BFV operations are performed with using GPU. Since the library uses multiple coefficient modulus with RNS,
 it is very suitable for parallel operation. That's why the library has an NTT GPU implementation that can perform batch-NTT.
