@@ -1,7 +1,7 @@
 This study is a part of Alişah Özcan's master's thesis and was done for educational purposes. There may be shortcomings.
 
 In this Library, BFV operations are performed with using GPU. Since the library uses multiple coefficient modulus with RNS,
-it is very suitable for parallel operation. That's why the library has an NTT GPU implementation that can pereform batch-NTT.
+it is very suitable for parallel operation. That's why the library has an NTT GPU implementation that can perform batch-NTT.
 
 The library currently only performing for 128 bit security level and certain ring sizes(4096, 8192, 16384, 32768).
 Since this library is still a prototype, it works with precomputed parameters for now. For example,
