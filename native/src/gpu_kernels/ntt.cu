@@ -1,13 +1,9 @@
-// (C) Ulvetanna Inc.
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 // Developer: Alişah Özcan
-// Paper: https://eprint.iacr.org/2023/1410
+// Paper: https://ieeexplore.ieee.org/document/10097488
 
 #include "ntt.cuh"
-
-#define CC_89 // for RTX 4090
-// TODO: All Kernel Initialization will be updated with respect to GPUs. (A100, RTX4090, RTX3060Ti)
 
 __device__ void CooleyTukeyUnit(Data& U, Data& V, Root& root, Modulus& modulus)
 {
@@ -30,10 +26,94 @@ __device__ void GentlemanSandeUnit(Data& U, Data& V, Root& root,
     V = VALUE_GPU::mult(v_, root, modulus);
 }
 
-__global__ void ForwardCore(Data* polynomial_in, Data* polynomial_out, Root* root_of_unity_table,
-                            Modulus* modulus, int shared_index, int logm,
-                            int outer_iteration_count, int N_power,
-                            bool zero_padding, bool not_last_kernel,
+__global__ void FORWARD_NTT_IEEE_REG(Data* Inputs, Data* Outputs, Root* root_of_unity_table, Modulus* modulus, int m_, int t_2_, int k_, int outer_loop, int inner_loop, int N_power, int mod_count)
+{
+
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	int j = blockIdx.y;
+
+    int mod_index = j % mod_count;
+
+	int m = m_;
+	int t_2 = t_2_;
+    int k = k_;
+
+	int addresss = i + (j << N_power);
+
+    unsigned long long local[16];
+
+    for (int inner = 0; inner < (inner_loop << 1); inner++)
+    {
+        local[inner] = Inputs[addresss + (inner << 11)];
+    }
+
+    for (int outer = 0; outer < outer_loop; outer++)
+    {
+        for (int inner = 0; inner < inner_loop; inner++)
+        {   
+            int Reg_Location = ((inner / k) * k) + inner;
+            CooleyTukeyUnit(local[Reg_Location],
+                            local[Reg_Location + k],
+                            root_of_unity_table[m + ((i + (inner << 11)) >> t_2) + (mod_index << N_power)], modulus[mod_index]);
+        }
+        m = m << 1;
+	    t_2 = t_2 - 1;
+        k = k >> 1;
+    }
+
+    for (int inner = 0; inner < (inner_loop << 1); inner++)
+    {
+        Outputs[addresss + (inner << 11)] = local[inner];
+    }
+
+}
+
+
+__global__ void INVERSE_NTT_IEEE_REG(Data* Inputs, Data* Outputs, Root* root_of_unity_table, Modulus* modulus, int m_, int t_2_, int k_, int outer_loop, int inner_loop, int N_power, Ninverse* n_inverse, int mod_count)
+{
+
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	int j = blockIdx.y;
+
+    int mod_index = j % mod_count;
+
+	int m = m_;
+	int t_2 = t_2_;
+    int k = k_;
+
+	int addresss = i + (j << N_power);
+
+    unsigned long long local[16];
+
+    for (int inner = 0; inner < (inner_loop << 1); inner++)
+    {
+        local[inner] = Inputs[addresss + (inner << 11)];
+    }
+
+    for (int outer = 0; outer < outer_loop; outer++)
+    {
+        for (int inner = 0; inner < inner_loop; inner++)
+        {   
+            int Reg_Location = ((inner / k) * k) + inner;
+            GentlemanSandeUnit(local[Reg_Location],
+                            local[Reg_Location + k],
+                            root_of_unity_table[m + ((i + (inner << 11)) >> t_2) + (mod_index << N_power)], modulus[mod_index]);
+        }
+        m = m >> 1;
+	    t_2 = t_2 + 1;
+        k = k << 1;
+    }
+
+    for (int inner = 0; inner < (inner_loop << 1); inner++)
+    {
+        Outputs[addresss + (inner << 11)] = VALUE_GPU::mult(local[inner], n_inverse[mod_index], modulus[mod_index]);
+    }
+
+}
+
+
+__global__ void FORWARD_NTT_IEEE_SHARED(Data* polynomial_in, Data* polynomial_out, Root* root_of_unity_table,
+                            Modulus* modulus, int logm, int N_power,
                             bool reduction_poly_check, int mod_count)
 {
     const int idx_x = threadIdx.x;
@@ -48,24 +128,23 @@ __global__ void ForwardCore(Data* polynomial_in, Data* polynomial_out, Root* roo
 
     int t_2 = N_power - logm - 1;
     location_t offset = 1 << (N_power - logm - 1);
-    int t_ = shared_index;
+    int t_ = 10;
     location_t m = (location_t)1 << logm;
 
     location_t global_addresss =
         idx_x +
-        (location_t)(idx_y * (offset / (1 << (outer_iteration_count - 1)))) +
+        (location_t)(idx_y * (offset / (1 << (10)))) +
         (location_t)(blockDim.x * block_x) +
         (location_t)(2 * block_y * offset) + (location_t)(block_z << N_power);
 
     location_t omega_addresss =
         idx_x +
-        (location_t)(idx_y * (offset / (1 << (outer_iteration_count - 1)))) +
+        (location_t)(idx_y * (offset / (1 << (10)))) +
         (location_t)(blockDim.x * block_x) + (location_t)(block_y * offset);
 
 
     location_t shared_addresss = (idx_x + (idx_y * blockDim.x));
 
-    // Load data from global & store to shared
     shared_memory[shared_addresss] = polynomial_in[global_addresss];
     shared_memory[shared_addresss + (blockDim.x * blockDim.y)] =
         polynomial_in[global_addresss + offset];
@@ -73,90 +152,59 @@ __global__ void ForwardCore(Data* polynomial_in, Data* polynomial_out, Root* roo
     int t = 1 << t_;
     int in_shared_address = ((shared_addresss >> t_) << t_) + shared_addresss;
     location_t current_root_index;
-    if (not_last_kernel)
+
+#pragma unroll
+    for (int lp = 0; lp < 5; lp++) 
     {
-#pragma unroll
-        for (int lp = 0; lp < outer_iteration_count; lp++)
-        {
-            __syncthreads();
-            if (reduction_poly_check)
-            {  // X_N_minus
-                current_root_index = (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
-            }
-            else
-            {  // X_N_plus
-                current_root_index = m + (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
-            }
-            CooleyTukeyUnit(shared_memory[in_shared_address],
-                            shared_memory[in_shared_address + t],
-                            root_of_unity_table[current_root_index], modulus[mod_index]);
-
-            t = t >> 1;
-            t_2 -= 1;
-            t_ -= 1;
-            m <<= 1;
-
-            in_shared_address =
-                ((shared_addresss >> t_) << t_) + shared_addresss;
-            //__syncthreads();
-        }
         __syncthreads();
+        if (reduction_poly_check)
+        {  // X_N_minus
+            current_root_index = (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
+        }
+        else
+        {  // X_N_plus
+            current_root_index = m + (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
+        }
+
+        CooleyTukeyUnit(shared_memory[in_shared_address],
+                        shared_memory[in_shared_address + t],
+                        root_of_unity_table[current_root_index], modulus[mod_index]);
+
+        t = t >> 1;
+        t_2 -= 1;
+        t_ -= 1;
+        m <<= 1;
+
+        in_shared_address =
+            ((shared_addresss >> t_) << t_) + shared_addresss;
     }
-    else
+    __syncthreads();
+
+#pragma unroll
+    for (int lp = 0; lp < 6; lp++)
     {
-#pragma unroll
-        for (int lp = 0; lp < (shared_index - 5); lp++) // 4 for 512 thread
-        {
-            __syncthreads();
-            if (reduction_poly_check)
-            {  // X_N_minus
-                current_root_index = (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
-            }
-            else
-            {  // X_N_plus
-                current_root_index = m + (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
-            }
-
-            CooleyTukeyUnit(shared_memory[in_shared_address],
-                            shared_memory[in_shared_address + t],
-                            root_of_unity_table[current_root_index], modulus[mod_index]);
-
-            t = t >> 1;
-            t_2 -= 1;
-            t_ -= 1;
-            m <<= 1;
-
-            in_shared_address =
-                ((shared_addresss >> t_) << t_) + shared_addresss;
-            //__syncthreads();
+        if (reduction_poly_check)
+        {  // X_N_minus
+            current_root_index = (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
         }
-        __syncthreads();
-
-#pragma unroll
-        for (int lp = 0; lp < 6; lp++)
-        {
-            if (reduction_poly_check)
-            {  // X_N_minus
-                current_root_index = (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
-            }
-            else
-            {  // X_N_plus
-                current_root_index = m + (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
-            }
-            CooleyTukeyUnit(shared_memory[in_shared_address],
-                            shared_memory[in_shared_address + t],
-                            root_of_unity_table[current_root_index], modulus[mod_index]);
-
-            t = t >> 1;
-            t_2 -= 1;
-            t_ -= 1;
-            m <<= 1;
-
-            in_shared_address =
-                ((shared_addresss >> t_) << t_) + shared_addresss;
+        else
+        {  // X_N_plus
+            current_root_index = m + (omega_addresss >> t_2) + (location_t)(mod_index << N_power);
         }
-        __syncthreads();
+        CooleyTukeyUnit(shared_memory[in_shared_address],
+                        shared_memory[in_shared_address + t],
+                        root_of_unity_table[current_root_index], modulus[mod_index]);
+
+        t = t >> 1;
+        t_2 -= 1;
+        t_ -= 1;
+        m <<= 1;
+
+        in_shared_address =
+            ((shared_addresss >> t_) << t_) + shared_addresss;
     }
+    __syncthreads();
+    
 
     polynomial_out[global_addresss] = shared_memory[shared_addresss];
     polynomial_out[global_addresss + offset] =
@@ -165,10 +213,8 @@ __global__ void ForwardCore(Data* polynomial_in, Data* polynomial_out, Root* roo
 
 
 
-__global__ void InverseCore(Data* polynomial_in, Data* polynomial_out, Root* inverse_root_of_unity_table,
-                            Modulus* modulus, int shared_index, int logm, int k,
-                            int outer_iteration_count, int N_power,
-                            Ninverse* n_inverse, bool last_kernel,
+__global__ void INVERSE_NTT_IEEE_SHARED(Data* polynomial_in, Data* polynomial_out, Root* inverse_root_of_unity_table,
+                            Modulus* modulus, int logm, int k, int N_power,
                             bool reduction_poly_check, int mod_count)
 {
     const int idx_x = threadIdx.x;
@@ -183,20 +229,20 @@ __global__ void InverseCore(Data* polynomial_in, Data* polynomial_out, Root* inv
 
     int t_2 = N_power - logm - 1;
     location_t offset = 1 << (N_power - k - 1);
-    //int t_ = 9 - outer_iteration_count;
-    int t_ = (shared_index + 1) - outer_iteration_count;
-    int loops = outer_iteration_count;
+
+    int t_ = 0;
+    int loops = 11;
     location_t m = (location_t)1 << logm;
 
     location_t global_addresss =
         idx_x +
-        (location_t)(idx_y * (offset / (1 << (outer_iteration_count - 1)))) +
+        (location_t)(idx_y * (offset / (1 << (11 - 1)))) +
         (location_t)(blockDim.x * block_x) +
         (location_t)(2 * block_y * offset) + (location_t)(block_z << N_power);
 
     location_t omega_addresss =
         idx_x +
-        (location_t)(idx_y * (offset / (1 << (outer_iteration_count - 1)))) +
+        (location_t)(idx_y * (offset / (1 << (11 - 1)))) +
         (location_t)(blockDim.x * block_x) + (location_t)(block_y * offset);
     location_t shared_addresss = (idx_x + (idx_y * blockDim.x));
 
@@ -234,20 +280,10 @@ __global__ void InverseCore(Data* polynomial_in, Data* polynomial_out, Root* inv
     }
     __syncthreads();
 
-    if (last_kernel)
-    {
-        polynomial_out[global_addresss] =
-            VALUE_GPU::mult(shared_memory[shared_addresss], n_inverse[mod_index], modulus[mod_index]);
-        polynomial_out[global_addresss + offset] = VALUE_GPU::mult(
-            shared_memory[shared_addresss + (blockDim.x * blockDim.y)],
-            n_inverse[mod_index], modulus[mod_index]);
-    }
-    else
-    {
-        polynomial_out[global_addresss] = shared_memory[shared_addresss];
-        polynomial_out[global_addresss + offset] =
-            shared_memory[shared_addresss + (blockDim.x * blockDim.y)];
-    }
+    polynomial_out[global_addresss] = shared_memory[shared_addresss];
+    polynomial_out[global_addresss + offset] =
+        shared_memory[shared_addresss + (blockDim.x * blockDim.y)];
+    
 }
 
 
@@ -260,72 +296,46 @@ __host__ void GPU_NTT(Data* device_in, Data* device_out, Root* root_of_unity_tab
             switch (cfg.n_power)
             {
                 case 12:
-                    ForwardCore<<<dim3(8, 1, batch_size), dim3(64, 4),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 0, 3,
-                        cfg.n_power, cfg.zero_padding, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
+                    FORWARD_NTT_IEEE_REG<<<dim3(2, batch_size), dim3(1024),
+                                  0, cfg.stream>>>(device_in, device_out, root_of_unity_table, modulus, 1, 11, 1, 1, 1, 12, mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    ForwardCore<<<dim3(1, 8, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 3, 9,
-                        cfg.n_power, false, false,
+                    FORWARD_NTT_IEEE_SHARED<<<dim3(1, 2, batch_size), dim3(1024, 1),
+                                  2048 * sizeof(Data), cfg.stream>>>(
+                        device_out, device_out, root_of_unity_table, modulus, 1,
+                        cfg.n_power,
                         (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
                     break;
                 case 13:
-                    ForwardCore<<<dim3(16, 1, batch_size), dim3(32, 8),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 0, 4,
-                        cfg.n_power, cfg.zero_padding, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
+                    FORWARD_NTT_IEEE_REG<<<dim3(2, batch_size), dim3(1024),
+                                  0, cfg.stream>>>(device_in, device_out, root_of_unity_table, modulus, 1, 12, 2, 2, 2, 13, mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    ForwardCore<<<dim3(1, 16, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 4, 9,
-                        cfg.n_power, false, false,
+                    FORWARD_NTT_IEEE_SHARED<<<dim3(1, 4, batch_size), dim3(1024, 1),
+                                  2048 * sizeof(Data), cfg.stream>>>(
+                        device_out, device_out, root_of_unity_table, modulus, 2,
+                        cfg.n_power,
                         (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
                     break;
                 case 14:
-                    ForwardCore<<<dim3(32, 1, batch_size), dim3(16, 16),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 0, 5,
-                        cfg.n_power, cfg.zero_padding, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
+                    FORWARD_NTT_IEEE_REG<<<dim3(2, batch_size), dim3(1024),
+                                  0, cfg.stream>>>(device_in, device_out, root_of_unity_table, modulus, 1, 13, 4, 3, 4, 14, mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    ForwardCore<<<dim3(1, 32, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 5, 9,
-                        cfg.n_power, false, false,
+                    FORWARD_NTT_IEEE_SHARED<<<dim3(1, 8, batch_size), dim3(1024, 1),
+                                  2048 * sizeof(Data), cfg.stream>>>(
+                        device_out, device_out, root_of_unity_table, modulus, 3,
+                        cfg.n_power,
                         (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
                     break;
                 case 15:
-                    ForwardCore<<<dim3(64, 1, batch_size), dim3(8, 32),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 0, 6,
-                        cfg.n_power, cfg.zero_padding, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
+                    FORWARD_NTT_IEEE_REG<<<dim3(2, batch_size), dim3(1024),
+                                  0, cfg.stream>>>(device_in, device_out, root_of_unity_table, modulus, 1, 14, 8, 4, 8, 15, mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    ForwardCore<<<dim3(1, 64, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 6, 9,
-                        cfg.n_power, false, false,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
-                    THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    break;
-                case 16:
-                    ForwardCore<<<dim3(128, 1, batch_size), dim3(4, 64),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 0, 7,
-                        cfg.n_power, cfg.zero_padding, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
-                    THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    ForwardCore<<<dim3(1, 128, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 7, 9,
-                        cfg.n_power, false, false,
+                    FORWARD_NTT_IEEE_SHARED<<<dim3(1, 16, batch_size), dim3(1024, 1),
+                                  2048 * sizeof(Data), cfg.stream>>>(
+                        device_out, device_out, root_of_unity_table, modulus, 4,
+                        cfg.n_power,
                         (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
                     break;
@@ -338,73 +348,48 @@ __host__ void GPU_NTT(Data* device_in, Data* device_out, Root* root_of_unity_tab
             switch (cfg.n_power)
             {
                 case 12:
-                    InverseCore<<<dim3(1, 8, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 11, 3, 9,
-                        cfg.n_power, cfg.mod_inverse, false,
+                    INVERSE_NTT_IEEE_SHARED<<<dim3(1, 2, batch_size), dim3(1024, 1),
+                                  2048 * sizeof(Data), cfg.stream>>>(
+                        device_in, device_out, root_of_unity_table, modulus, 11, 1,
+                        cfg.n_power,
                         (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    InverseCore<<<dim3(8, 1, batch_size), dim3(64, 4),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 2, 0, 3,
-                        cfg.n_power, cfg.mod_inverse, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
+                    
+                    INVERSE_NTT_IEEE_REG<<<dim3(2, batch_size), dim3(1024),
+                                                    0, cfg.stream>>>(device_out, device_out, root_of_unity_table, modulus, 1, 11, 1, 1, 1, 12, cfg.mod_inverse, mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
                     break;
                 case 13:
-                    InverseCore<<<dim3(1, 16, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 12, 4, 9,
-                        cfg.n_power, cfg.mod_inverse, false,
+                    INVERSE_NTT_IEEE_SHARED<<<dim3(1, 4, batch_size), dim3(1024, 1),
+                                  2048 * sizeof(Data), cfg.stream>>>(
+                        device_in, device_out, root_of_unity_table, modulus, 12, 2,
+                        cfg.n_power,
                         (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    InverseCore<<<dim3(16, 1, batch_size), dim3(32, 8),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 3, 0, 4,
-                        cfg.n_power, cfg.mod_inverse, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
+                    INVERSE_NTT_IEEE_REG<<<dim3(2, batch_size), dim3(1024),
+                                                    0, cfg.stream>>>(device_out, device_out, root_of_unity_table, modulus, 2, 11, 1, 2, 2, 13, cfg.mod_inverse, mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
                     break;
                 case 14:
-                    InverseCore<<<dim3(1, 32, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 13, 5, 9,
-                        cfg.n_power, cfg.mod_inverse, false,
+                    INVERSE_NTT_IEEE_SHARED<<<dim3(1, 8, batch_size), dim3(1024, 1),
+                                  2048 * sizeof(Data), cfg.stream>>>(
+                        device_in, device_out, root_of_unity_table, modulus, 13, 3,
+                        cfg.n_power,
                         (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    InverseCore<<<dim3(32, 1, batch_size), dim3(16, 16),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 4, 0, 5,
-                        cfg.n_power, cfg.mod_inverse, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
+                    INVERSE_NTT_IEEE_REG<<<dim3(2, batch_size), dim3(1024),
+                                                    0, cfg.stream>>>(device_out, device_out, root_of_unity_table, modulus, 4, 11, 1, 3, 4, 14, cfg.mod_inverse, mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
                     break;
                 case 15:
-                    InverseCore<<<dim3(1, 64, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 14, 6, 9,
-                        cfg.n_power, cfg.mod_inverse, false,
+                    INVERSE_NTT_IEEE_SHARED<<<dim3(1, 16, batch_size), dim3(1024, 1),
+                                  2048 * sizeof(Data), cfg.stream>>>(
+                        device_in, device_out, root_of_unity_table, modulus, 14, 4,
+                        cfg.n_power,
                         (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    InverseCore<<<dim3(64, 1, batch_size), dim3(8, 32),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 5, 0, 6,
-                        cfg.n_power, cfg.mod_inverse, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
-                    THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    break;
-                case 16:
-                    InverseCore<<<dim3(1, 128, batch_size), dim3(256, 1),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_in, device_out, root_of_unity_table, modulus, 8, 15, 7, 9,
-                        cfg.n_power, cfg.mod_inverse, false,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
-                    THROW_IF_CUDA_ERROR(cudaGetLastError());
-                    InverseCore<<<dim3(128, 1, batch_size), dim3(4, 64),
-                                  512 * sizeof(Data), cfg.stream>>>(
-                        device_out, device_out, root_of_unity_table, modulus, 8, 6, 0, 7,
-                        cfg.n_power, cfg.mod_inverse, true,
-                        (cfg.reduction_poly == ReductionPolynomial::X_N_minus), mod_count);
+                    INVERSE_NTT_IEEE_REG<<<dim3(2, batch_size), dim3(1024),
+                                                    0, cfg.stream>>>(device_out, device_out, root_of_unity_table, modulus, 8, 11, 1, 4, 8, 15, cfg.mod_inverse, mod_count);
                     THROW_IF_CUDA_ERROR(cudaGetLastError());
                     break;
 

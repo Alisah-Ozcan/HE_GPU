@@ -1,8 +1,7 @@
-// (C) Ulvetanna Inc.
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 // Developer: Alişah Özcan
-// Paper: https://eprint.iacr.org/2023/1410
+// Paper: https://ieeexplore.ieee.org/document/10097488
 
 #include <curand_kernel.h>
 #include <stdio.h>
@@ -14,7 +13,6 @@
 #include "../common.cuh"
 #include "cuda_runtime.h"
 #include "nttparameters.cuh"
-//#include "ntt_cpu.cuh"
 
 // --------------------- //
 // Authors: Alisah Ozcan
@@ -24,13 +22,7 @@
 #define NTT_FFT_CORE_H
 
 typedef unsigned location_t;
-/*
-#if MAX_LOG2_RINGSIZE <= 32
-typedef unsigned location_t;
-#else
-typedef unsigned long long location_t;
-#endif
-*/
+
 enum type
 {
     FORWARD,
@@ -52,20 +44,17 @@ __device__ void CooleyTukeyUnit(Data& U, Data& V, Root& root, Modulus& modulus);
 __device__ void GentlemanSandeUnit(Data& U, Data& V, Root& root,
                                    Modulus& modulus);
 
-__global__ void ForwardCore(Data* polynomial_in, Data* polynomial_out, Root* root_of_unity_table,
-                            Modulus* modulus, int shared_index, int logm,
-                            int outer_iteration_count, int N_power,
-                            bool zero_padding, bool not_last_kernel,
+__global__ void FORWARD_NTT_IEEE_SHARED(Data* polynomial_in, Data* polynomial_out, Root* root_of_unity_table,
+                            Modulus* modulus, int logm, int N_power,
                             bool reduction_poly_check, int mod_count);
 
-
-__global__ void InverseCore(Data* polynomial_in, Data* polynomial_out, Root* inverse_root_of_unity_table,
-                            Modulus* modulus, int shared_index, int logm, int k,
-                            int outer_iteration_count, int N_power,
-                            Ninverse* n_inverse, bool last_kernel,
+__global__ void INVERSE_NTT_IEEE_SHARED(Data* polynomial_in, Data* polynomial_out, Root* inverse_root_of_unity_table,
+                            Modulus* modulus, int logm, int k, int N_power,
                             bool reduction_poly_check, int mod_count);
 
+__global__ void FORWARD_NTT_IEEE_REG(Data* Inputs, Data* Outputs, Root* root_of_unity_table, Modulus* modulus, int m_, int t_2_, int k_, int outer_loop, int inner_loop, int N_power, int mod_count);
 
+__global__ void INVERSE_NTT_IEEE_REG(Data* Inputs, Data* Outputs, Root* root_of_unity_table, Modulus* modulus, int m_, int t_2_, int k_, int outer_loop, int inner_loop, int N_power, Ninverse* n_inverse, int mod_count);
 
 __host__ void GPU_NTT(Data* device_in, Data* device_out, Root* root_of_unity_table,
                       Modulus* modulus, ntt_configuration cfg, int batch_size, int mod_count);
@@ -77,7 +66,6 @@ __global__ void GPU_ACTIVITY(unsigned long long* output,
                              unsigned long long fix_num);
 __host__ void GPU_ACTIVITY_HOST(unsigned long long* output,
                                 unsigned long long fix_num);
-
 
 __global__ void GPU_ACTIVITY2(unsigned long long* input1, unsigned long long* input2);
 __host__ void GPU_ACTIVITY2_HOST(unsigned long long* input1, unsigned long long* input2, unsigned size);
