@@ -1,4 +1,4 @@
-# Notice: This Repository is No Longer Maintained, can be accessed the restructured library here (https://github.com/Alisah-Ozcan/HEonGPU).
+# Notice: This Repository is no longer maintained, can be accessed the restructured library here (https://github.com/Alisah-Ozcan/HEonGPU).
 
 
 This study is a part of Alişah Özcan's master's thesis(https://research.sabanciuniv.edu/id/eprint/49756/1/10602991.%C3%96zcan.pdf) and was done for educational purposes.
